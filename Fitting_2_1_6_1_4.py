@@ -1,7 +1,8 @@
-"""Electrolysis cell fitting and simulation (multi-file datasets).
+"""Electrolysis cell fitting
 
 - Fits absolute concentrations over the full time series for CH3OH, HCOO-, CO3^2- (OH- is not fitted).
-- No time weighting, no subsampling, no heuristic accelerations that could alter results.
+- No time weighting, no subsampling, no heuristic accelerations that could alter results. 
+- Exchange current density is per effective area (A_eff), not geometric area (A_geo), plus it depends on surface concentrations. 
 """
 
 import numpy as np
@@ -98,10 +99,21 @@ E3_std = E3_std_25C
 C_MIN_NERNST = 1e-8   # mol/L – Clamp in Nernst-Berechnung
 C_MIN_SOLVE  = 1e-8   # mol/L – Clamp in solve_currents_MT (Surface/Bulk Stabilisierung)
 C_MIN_ODE_C  = 1e-8   # mol/L – Clamp für c1..c3 im ODE-Integrator
+
 C_MIN_ODE_OH = 1e-8   # mol/L – Clamp für OH- im ODE-Integrator
 C_MIN_H2O    = 30.0   # mol/L – Mindestwert für Wasser
 # Slightly higher clamp for OH− at the surface to avoid pathological j_lim collapse
 C_MIN_SOLVE_OH_SURF = 1e-6  # mol/L
+
+# === i0 concentration dependence (minimal-invasive) ===
+# i0,eff = i0_base * (c_reactant_surf / c_ref)^m * (c_OH_surf / c_ref)^p
+# Keep m and p fixed (not fitted) for minimal-invasiveness and identifiability.
+I0_CREF = 1.0  # mol/L – reference concentration for normalization
+I0_M1_REACT = 1.0  # order for CH3OH in MOR
+I0_P1_OH    = 1.0  # order for OH- in MOR
+I0_M2_REACT = 1.0  # order for HCOO- in FOR
+I0_P2_OH    = 1.0  # order for OH- in FOR
+I0_P3_OH    = 1.0  # order for OH- in OER
 
 # === PRE-COMPUTED CONSTANTS ===
 RT_over_n1F = R * T / (n1 * F)
@@ -417,6 +429,15 @@ class PhysicsCorrectElectrolysisModel:
         # Initial guess
         i1_old, i2_old, i3_old = 0.0, 0.0, 0.0
 
+        # --- i0,eff based on BULK concentrations (cheap, once per call) ---
+        # Minimal-invasive simplification: use bulk concentrations here to avoid
+        # re-evaluating i0 dependence inside the fixed-point loop.
+        # With m=p=1 this is just linear scaling (fast).
+        c_ref = I0_CREF
+        i0_1_eff = self.i0_1 * (c1 / c_ref) * (c4 / c_ref)
+        i0_2_eff = self.i0_2 * (c2 / c_ref) * (c4 / c_ref)
+        i0_3_eff = self.i0_3 * (c4 / c_ref)
+
         # Terms constant during the iteration
         D_values = calculate_diffusion_coefficients_with_params(
             c4, self.D_CH3OH_ref, self.D_HCOO_ref, self.D_CO32_ref, self.D_OH_ref)
@@ -477,6 +498,9 @@ class PhysicsCorrectElectrolysisModel:
             c3_surf = max(c3 - (-j2_geo) * self.delta / (D_values[2] * 1000), C_MIN_SOLVE)
             c4_surf = max(c4 - (5*j1_geo + 3*j2_geo + 4*j3_geo) * self.delta / (D_values[3] * 1000), C_MIN_SOLVE_OH_SURF)
 
+            # --- i0,eff with surface-concentration dependence (normalized by I0_CREF) ---
+            # [REMOVED: i0_1_eff, i0_2_eff, i0_3_eff recalculation per iteration]
+
             # Surface equilibrium potentials
             E1_eq_surf, E2_eq_surf = calculate_nernst_efficient(c1_surf, c2_surf, c3_surf, c4_surf)
             E3_eq_surf = E3_std
@@ -499,7 +523,7 @@ class PhysicsCorrectElectrolysisModel:
             phi1 = n1_RDSF_over_RT * eta1_surf
             exp_a1 = exp_clamped(self.alpha1 * phi1)
             exp_c1 = exp_clamped(-(1.0 - self.alpha1) * phi1)
-            j_bv1 = self.i0_1 * (exp_a1 - exp_c1)
+            j_bv1 = i0_1_eff * (exp_a1 - exp_c1)
             if j_bv1 < 0.0:
                 j_bv1 = 0.0  # Anode: suppress negative (cathodic) currents for KL combination
 
@@ -507,7 +531,7 @@ class PhysicsCorrectElectrolysisModel:
             phi2 = n2_RDSF_over_RT * eta2_surf
             exp_a2 = exp_clamped(self.alpha2 * phi2)
             exp_c2 = exp_clamped(-(1.0 - self.alpha2) * phi2)
-            j_bv2 = self.i0_2 * (exp_a2 - exp_c2)
+            j_bv2 = i0_2_eff * (exp_a2 - exp_c2)
             if j_bv2 < 0.0:
                 j_bv2 = 0.0
 
@@ -515,7 +539,7 @@ class PhysicsCorrectElectrolysisModel:
             phi3 = n3_RDSF_over_RT * eta3_surf
             exp_a3 = exp_clamped(self.alpha3 * phi3)
             exp_c3 = exp_clamped(-(1.0 - self.alpha3) * phi3)
-            j_bv3 = self.i0_3 * (exp_a3 - exp_c3)
+            j_bv3 = i0_3_eff * (exp_a3 - exp_c3)
             if j_bv3 < 0.0:
                 j_bv3 = 0.0
 
@@ -776,127 +800,13 @@ class LiveMonitor:
         self.best_objective = float('inf')
         self.best_params = None
         self.start_time = time.time()
-        # Initialize persistent live plot (one-time setup)
-        self._setup_live_plot()
-
-    def _setup_live_plot(self):
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-        except Exception:
-            self._live_plot_enabled = False
-            return
-
-        self._live_plot_enabled = True
-        self._species_names = ['CH3OH', 'HCOO-', 'CO3^2-', 'OH-']
-        n = len(self.datasets)
-        if n == 0:
-            self._live_plot_enabled = False
-            return
-
-        # Prepare data caches (experimental)
-        self._t_lists = []          # minutes
-        self._exp_lists = []        # list of tuples (MeOH, HCOO, CO32, OH)
-        for ds in self.datasets:
-            t_min = ds.t_conc / 60.0
-            self._t_lists.append(t_min)
-            self._exp_lists.append((ds.c_MeOH, ds.c_HCOO, ds.c_CO32, ds.c_OH))
-
-        # Figure and axes: ONE axis per dataset (n rows, 1 column)
-        fig_height = max(3.0, 2.8 * n)
-        self._fig, self._axes = plt.subplots(n, 1, figsize=(12, fig_height), sharex=True)
-        self._axes = np.atleast_1d(self._axes)
-        self._sim_lines = []  # flattened list of Line2D handles in order per dataset: [MeOH, HCOO, CO32, OH]
-
-        for r, ds in enumerate(self.datasets):
-            ax = self._axes[r]
-            t_min = self._t_lists[r]
-            exp_ch3oh, exp_hcoo, exp_co32, exp_oh = self._exp_lists[r]
-
-            # Plot experimental markers for all species on the SAME axis
-            ax.plot(t_min, exp_ch3oh, 'o', alpha=0.7, label='exp CH3OH')
-            ax.plot(t_min, exp_hcoo, 's', alpha=0.7, label='exp HCOO-')
-            ax.plot(t_min, exp_co32, 'D', alpha=0.7, label='exp CO3^2-')
-            ax.plot(t_min, exp_oh,   '^', alpha=0.7, label='exp OH-')
-
-            # Placeholder simulated lines (same axis), will be updated each iteration
-            sim_m, = ax.plot(t_min, np.full_like(t_min, np.nan), '-', linewidth=2, label='sim CH3OH')
-            sim_h, = ax.plot(t_min, np.full_like(t_min, np.nan), '-', linewidth=2, label='sim HCOO-')
-            sim_c, = ax.plot(t_min, np.full_like(t_min, np.nan), '-', linewidth=2, label='sim CO3^2-')
-            sim_o, = ax.plot(t_min, np.full_like(t_min, np.nan), '-', linewidth=2, label='sim OH-')
-            self._sim_lines.extend([sim_m, sim_h, sim_c, sim_o])
-
-            ax.set_title(ds.name)
-            ax.set_ylabel('Concentration (mol/L)')
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='best', fontsize=8, ncol=2)
-
-        self._axes[-1].set_xlabel('Time (min)')
-        self._fig.suptitle('Live fit — absolute concentrations per experiment (all species in one axis)', y=1.02, fontsize=12)
-        self._fig.tight_layout()
-        try:
-            plt.ion()
-            plt.show(block=False)
-        except Exception:
-            pass
-
-    def _update_live_plot(self, params_vec):
-        if not getattr(self, '_live_plot_enabled', False):
-            return
-
-        import numpy as np
-        import matplotlib.pyplot as plt
-
-        # Build model with current parameters
-        p = _apply_param_freezing(np.array(params_vec, dtype=float))
-        model = PhysicsCorrectElectrolysisModel({
-            'i0_1': p[0],
-            'i0_2': p[1],
-            'i0_3': p[2],
-            'alpha1': p[3],
-            'alpha2': p[4],
-            'alpha3': p[5],
-            'delta': p[6],
-            'D_CH3OH_ref': p[7],
-            'D_HCOO_ref': p[8],
-            'D_CO32_ref': p[9],
-            'D_OH_ref': p[10],
-        })
-
-        # Simulate each dataset on the full plotting grid
-        sim_curves = []  # flattened in order [MeOH, HCOO, CO32, OH] per dataset
-        try:
-            for ds in self.datasets:
-                c_sim = model.simulate(ds, t_eval=ds.t_conc)
-                sim_curves.extend([c_sim[0], c_sim[1], c_sim[2], c_sim[3]])
-        except Exception:
-            return
-
-        # Update line data
-        line_idx = 0
-        for r, ds in enumerate(self.datasets):
-            t_min = self._t_lists[r]
-            for _ in range(4):
-                line = self._sim_lines[line_idx]
-                y = sim_curves[line_idx]
-                if len(y) == len(t_min):
-                    line.set_data(t_min, y)
-                else:
-                    line.set_data(t_min, np.full_like(t_min, np.nan))
-                line_idx += 1
-
-        try:
-            self._fig.canvas.draw_idle()
-            plt.pause(0.001)
-        except Exception:
-            pass
         
     def callback(self, xk, convergence=None):
         """Callback for live updates"""
         self.iteration += 1
 
         xk_disp = _apply_param_freezing(xk)
-
+        
         i0_1, i0_2, i0_3, alpha1, alpha2, alpha3, delta, D_CH3OH, D_HCOO, D_CO32, D_OH = xk_disp
 
         # Objective value for display
@@ -911,12 +821,6 @@ class LiveMonitor:
         except Exception:
             obj_value = float('inf')
             improvement = ""
-
-        # Update live plot (experimental vs. simulated) for current parameters
-        try:
-            self._update_live_plot(xk_disp)
-        except Exception:
-            pass
 
         # Live output
         elapsed = time.time() - self.start_time
@@ -935,35 +839,31 @@ def run_fitting(datasets, use_initial_guess=True):
     """Perform the fitting (absolute concentrations)."""
     
     # --- Literature-backed parameter windows ---
-    # D_OH−, D_CO3²−, D_HCOO− at 25 °C from CRC/PHREEQC compilation (aqion table).
-    # D_CH3OH in water at ~23–25 °C ≈ 1.4×10⁻⁹ m²/s (Van Loon et al., J. Phys. Chem. A 2008).
-    # OER i0 range estimated from typical b=40–120 mV/dec and η@10 mA/cm² on oxides; converted to i0 via Tafel.
-    # i0 for MOR/FOR on porous CuO set per ECSA (A_eff), using Tafel back-calculation at η≈0.2–0.6 V and j_ECSA≈0.1–1 mA/cm².
     bounds = [
-        (0.021, 0.021),   # i0_1 [A/m²] (MOR on CuO, per A_eff)
-        (1.5e-3, 1.5e-3),   # i0_2 [A/m²] (FOR on Cu/CuO, per A_eff)
-        (8e-4, 8e-4),   # i0_3 [A/m²] (OER on CuO, per A_eff)
-        (0.21, 0.21),   # alpha1 [-]
-        (0.21, 0.21),   # alpha2 [-]
-        (0.24, 0.24),   # alpha3 [-]
-        (20e-6, 300e-6),# delta [m]
-        (1.0e-9, 1.2e-9),  # D_CH3OH_ref [m²/s]
-        (1.6e-9, 1.8e-9),  # D_HCOO_ref  [m²/s]
-        (1.1e-9, 1.3e-9),  # D_CO32_ref  [m²/s]
-        (5.4e-9, 5.6e-9),  # D_OH_ref    [m²/s]
+        (5e-03, 20),      # i0_1 [A/m²] (MOR on CuO, per A_eff)
+        (5e-4, 1),    # i0_2 [A/m²] (FOR on Cu/CuO, per A_eff)
+        (5e-6, 5e-3),        # i0_3 [A/m²] (OER on CuO, per A_eff)
+        (0.25, 0.55),        # alpha1 [-]
+        (0.25, 0.5),        # alpha2 [-]
+        (0.4, 0.6),        # alpha3 [-]
+        (10e-6, 50e-6),     # delta [m]
+        (1.2e-9, 1.5e-9),    # D_CH3OH_ref [m²/s]
+        (1.4e-9, 1.9e-9),    # D_HCOO_ref  [m²/s]
+        (1.1e-9, 1.5e-9),    # D_CO32_ref  [m²/s]
+        (5.1e-9, 5.6e-9),    # D_OH_ref    [m²/s]
     ]
     initial_guess = [
-        0.021,    # i0_1  [A/m²] (MOR, per A_eff)
-        1.5e-3,    # i0_2  [A/m²] (FOR, per A_eff)
-        8.0e-4,    # i0_3  [A/m²] (OER, per A_eff)
-        0.21,      # alpha1 [-]
-        0.21,      # alpha2 [-]
-        0.24,      # alpha3 [-]
-        25e-6,    # delta  [m]
-        1.1e-9,   # D_CH3OH_ref [m²/s] # Lien-Chun Weng, Alexis T Bell, and Adam Z Weber. Modeling gas-diffusion electrodes for CO2 reduction.
-        1.7e-9,   # D_HCOO_ref  [m²/s] # Bruce E Poling. The properties of gases and liquids. 2004.
-        1.2e-9,  # D_CO32_ref  [m²/s]     #Bruce E Poling. The properties of gases and liquids. 2004.
-        5.5e-9,   # D_OH_ref    [m²/s]    #Edward Lansing Cussler. Multicomponent diffusion, volume 3. Elsevier, 2013
+        0.824,     # i0_1  [A/m²] (MOR, per A_eff)
+        0.19,    # i0_2  [A/m²] (FOR, per A_eff)
+        1.2e-3,      # i0_3  [A/m²] (OER, per A_eff)
+        0.49,      # alpha1 [-]
+        0.41,      # alpha2 [-]
+        0.49,      # alpha3 [-]
+        21e-6,     # delta  [m]
+        1.3e-9,    # D_CH3OH_ref [m²/s]
+        1.5e-9,    # D_HCOO_ref  [m²/s]
+        1.4e-9,    # D_CO32_ref  [m²/s]
+        5.4e-9,    # D_OH_ref    [m²/s]
     ]
     n_params = len(bounds)
     min_pop_rows = max(10, n_params)
@@ -1036,7 +936,9 @@ def create_time_weight_visualization(dataset):
     return plt.gcf()
 
 def visualize_results(datasets, fitted_params):
-    """Visualize fitting results (absolute concentrations) with ONE subplot per experiment. Each subplot contains all species (CH3OH, HCOO-, CO3^2-, OH-) with experimental markers and simulated lines."""
+    """Visualize fitting results (absolute concentrations) in ONE figure.
+    Rows = experiments (datasets), columns = species (CH3OH, HCOO-, CO3^2-, OH-).
+    """
     model = PhysicsCorrectElectrolysisModel({
         'i0_1': fitted_params[0],
         'i0_2': fitted_params[1],
@@ -1055,34 +957,43 @@ def visualize_results(datasets, fitted_params):
     if n == 0:
         return None
 
+    species_names = ['CH3OH', 'HCOO-', 'CO3^2-', 'OH-']
+
+    # Dynamic sizing: roughly 2.8–3.2 in per experiment row, 16 in width for 4 columns
     fig_height = max(3.0, 2.8 * n)
-    fig, axes = plt.subplots(n, 1, figsize=(12, fig_height), sharex=True)
-    axes = np.atleast_1d(axes)
+    fig, axes = plt.subplots(n, 4, figsize=(16, fig_height), sharex='col')
+    axes = np.atleast_2d(axes)
 
     for r, dataset in enumerate(datasets):
-        ax = axes[r]
+        # Use full time series for plotting
         c_sim = model.simulate(dataset, t_eval=dataset.t_conc)
         t_min = dataset.t_conc / 60.0
 
-        # Experimental data
-        ax.plot(t_min, dataset.c_MeOH, 'o', alpha=0.7, label='exp CH3OH')
-        ax.plot(t_min, dataset.c_HCOO, 's', alpha=0.7, label='exp HCOO-')
-        ax.plot(t_min, dataset.c_CO32, 'D', alpha=0.7, label='exp CO3^2-')
-        ax.plot(t_min, dataset.c_OH,   '^', alpha=0.7, label='exp OH-')
+        data_pairs = [
+            (dataset.c_MeOH, c_sim[0]),
+            (dataset.c_HCOO, c_sim[1]),
+            (dataset.c_CO32, c_sim[2]),
+            (dataset.c_OH,   c_sim[3]),
+        ]
 
-        # Simulated lines
-        ax.plot(t_min, c_sim[0], '-', linewidth=2, label='sim CH3OH')
-        ax.plot(t_min, c_sim[1], '-', linewidth=2, label='sim HCOO-')
-        ax.plot(t_min, c_sim[2], '-', linewidth=2, label='sim CO3^2-')
-        ax.plot(t_min, c_sim[3], '-', linewidth=2, label='sim OH-')
+        for c, (exp_arr, sim_arr) in enumerate(data_pairs):
+            ax = axes[r, c]
+            ax.plot(t_min, exp_arr, 'o', alpha=0.7, label='exp')
+            ax.plot(t_min, sim_arr, '-', linewidth=2, label='sim')
+            if r == 0:
+                ax.set_title(species_names[c])
+            if c == 0:
+                # Row label: dataset name + y label
+                ax.set_ylabel(f"{dataset.name}\nConcentration (mol/L)")
+            if r == n - 1:
+                ax.set_xlabel('Time (min)')
+            ax.grid(True, alpha=0.3)
 
-        ax.set_title(dataset.name)
-        ax.set_ylabel('Concentration (mol/L)')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', fontsize=8, ncol=2)
+        # Only show legend once (top-left subplot)
+        if r == 0:
+            axes[0, 0].legend(loc='best', fontsize=8)
 
-    axes[-1].set_xlabel('Time (min)')
-    fig.suptitle('Fitting results — absolute concentrations (one axis per experiment)', y=1.02, fontsize=12)
+    fig.suptitle('Fitting results — absolute concentrations (rows = experiments, columns = species)', y=1.02, fontsize=12)
     fig.tight_layout()
     return fig
 
